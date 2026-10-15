@@ -1,0 +1,194 @@
+name: build
+
+# Builds a STOCK upstream strfry release (hoytech/strfry at a git tag, upstream
+# Dockerfile, no patches) and publishes ghcr.io/nosfabrica/strfry:<tag>.
+#
+# Why this exists: upstream only publishes ghcr.io/hoytech/strfry:latest, which
+# is overwritten by a push to ANY branch, so there is no image for a release tag.
+#
+# Deliberately separate from nosfabrica/strfry (the neofry fork): that fork's
+# neofry-build.yml derives its `:latest-<ver>` tag from the highest X.Y.Z git
+# tag in the fork, so upstream tags must not be pushed there.
+#
+# Structure mirrors nosfabrica/strfry@neofry neofry-build.yml: each arch on its
+# own native runner, pushed by digest, then a merge job tags the manifest list.
+on:
+  workflow_dispatch:
+    inputs:
+      strfry_tag:
+        description: "Upstream hoytech/strfry release tag (X.Y.Z), e.g. 1.1.3"
+        required: true
+        type: string
+      force:
+        description: "Overwrite the image tag if it already exists"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ inputs.strfry_tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/nosfabrica/strfry
+  UPSTREAM: https://github.com/hoytech/strfry
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      short: ${{ steps.check.outputs.short }}
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate tag and check for an existing image
+        id: check
+        env:
+          TAG: ${{ inputs.strfry_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::strfry_tag must be X.Y.Z, got '$TAG'"; exit 1
+          fi
+          # Peeled (^{}) entry first, in case the tag is annotated.
+          refs=$(git ls-remote --tags "$UPSTREAM" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          sha=$(awk '/\^\{\}$/ {print $1}' <<< "$refs")
+          [ -n "$sha" ] || sha=$(awk 'NR==1 {print $1}' <<< "$refs")
+          if [ -z "$sha" ]; then
+            echo "::error::tag $TAG not found in $UPSTREAM"; exit 1
+          fi
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            if [ "$FORCE" != "true" ]; then
+              echo "::error::$IMAGE:$TAG already exists; release tags are immutable (re-run with force to overwrite)"
+              exit 1
+            fi
+            echo "::warning::$IMAGE:$TAG exists; overwriting (force)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Building $UPSTREAM@$TAG ($sha)"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      # Pin to the commit preflight resolved, so a moved tag can't change
+      # what is built mid-run.
+      - name: Checkout upstream strfry
+        uses: actions/checkout@v7
+        with:
+          repository: hoytech/strfry
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest, untagged: nothing is referenceable until merge.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.title=strfry
+            org.opencontainers.image.description=Stock upstream strfry ${{ needs.preflight.outputs.tag }} (no patches)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=${{ env.UPSTREAM }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.sha }}
+            org.opencontainers.image.licenses=GPL-3.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifests and tag
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags: `:<tag>` and `:<tag>-sha-<short>`. Never `:latest` — nothing floats.
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SHORT: ${{ needs.preflight.outputs.short }}
+        run: |
+          args=(-t "$IMAGE:$TAG" -t "$IMAGE:$TAG-sha-$SHORT")
+          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "$IMAGE:${{ needs.preflight.outputs.tag }}"
